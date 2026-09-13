@@ -4,25 +4,24 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // Sample shape taken from live ImmortalWrt: iw dev phy1-ap0 station dump
 func TestParseIWStationDump(t *testing.T) {
 	raw := []byte(`Station 50:cf:56:f6:9c:b1 (on phy0-ap0)
-	inactive time:	80 ms
-	rx bytes:	1163449
-	rx packets:	1828
-	tx bytes:	998877
-	tx packets:	1500
-	tx retries:	3
-	tx failed:	0
-	signal:  	-55 [-55] dBm
-Station aa:bb:cc:dd:ee:ff (on phy0-ap0)
-	inactive time:	1000 ms
-	rx bytes:	100
-	tx bytes:	200
-`)
+		inactive time:	80 ms
+		rx bytes:	1163449
+		rx packets:	1828
+		tx bytes:	998877
+		tx packets:	1500
+		tx retries:	3
+		tx failed:	0
+		signal:  	-55 [-55] dBm
+	Station aa:bb:cc:dd:ee:ff (on phy0-ap0)
+		inactive time:	1000 ms
+		rx bytes:	100
+		tx bytes:	200
+	`)
 	sts := parseIWStationDump(raw, "phy0-ap0")
 	if len(sts) != 2 {
 		t.Fatalf("stations=%d", len(sts))
@@ -39,6 +38,51 @@ Station aa:bb:cc:dd:ee:ff (on phy0-ap0)
 	}
 }
 
+func TestParseIWIntRejectsGarbage(t *testing.T) {
+	if _, ok := parseIWInt("rx bytes: not-a-number"); ok {
+		t.Fatal("garbage")
+	}
+	n, ok := parseIWInt("tx bytes:	42 extra")
+	if !ok || n != 42 {
+		t.Fatalf("n=%d ok=%v", n, ok)
+	}
+}
+
+func TestParseIWDevAPOnly(t *testing.T) {
+	raw := []byte(`phy#0
+	Interface phy0-ap0
+		ifindex 15
+		wdev 0x2
+		addr 00:11:22:33:44:55
+		ssid home
+		type AP
+		channel 36 (5180 MHz), width: 80 MHz
+	Interface phy0-sta0
+		ifindex 16
+		type managed
+	Interface phy1-ap0
+		type AP
+	Interface wlan0
+		type AP-VLAN
+`)
+	got := parseIWDev(raw)
+	if len(got) != 3 {
+		t.Fatalf("got=%v", got)
+	}
+	if got[0] != "phy0-ap0" || got[1] != "phy1-ap0" || got[2] != "wlan0" {
+		t.Fatalf("got=%v", got)
+	}
+}
+
+func TestValidNetIface(t *testing.T) {
+	if !validNetIface("phy0-ap0") || !validNetIface("wlan0") {
+		t.Fatal("ok names")
+	}
+	if validNetIface("-v") || validNetIface(".hidden") || validNetIface("phy0 ap0") || validNetIface("") {
+		t.Fatal("bad names")
+	}
+}
+
 func TestEntryDelta(t *testing.T) {
 	if entryDelta(100, 40) != 60 {
 		t.Fatal("growth")
@@ -48,30 +92,6 @@ func TestEntryDelta(t *testing.T) {
 	}
 	if entryDelta(0, 50) != 0 {
 		t.Fatal("zero after reset")
-	}
-}
-
-func TestCollectorPerMACNoPhantom(t *testing.T) {
-	c := &Collector{
-		cfg:    Config{Interval: 30 * time.Second, RouterID: "t"},
-		meta:   newMetaCache(filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "missing")),
-		prev:   make(map[string]wifiStation),
-		primed: true,
-	}
-	c.prev["AA:BB:CC:DD:EE:01"] = wifiStation{MAC: "AA:BB:CC:DD:EE:01", RxBytes: 1000, TxBytes: 2000}
-	next := map[string]wifiStation{
-		"AA:BB:CC:DD:EE:01": {MAC: "AA:BB:CC:DD:EE:01", Iface: "phy0-ap0", RxBytes: 1500, TxBytes: 2100},
-		"AA:BB:CC:DD:EE:02": {MAC: "AA:BB:CC:DD:EE:02", Iface: "phy0-ap0", RxBytes: 99999999, TxBytes: 88888888},
-	}
-	var rx, tx int64
-	for mac, s := range next {
-		if p, ok := c.prev[mac]; ok {
-			rx += entryDelta(s.RxBytes, p.RxBytes)
-			tx += entryDelta(s.TxBytes, p.TxBytes)
-		}
-	}
-	if rx != 500 || tx != 100 {
-		t.Fatalf("rx=%d tx=%d want 500/100", rx, tx)
 	}
 }
 
@@ -100,5 +120,19 @@ func TestMetaDHCP(t *testing.T) {
 	meta := m.ResolveByMAC("50:CF:56:F6:9C:B1", "phy0-ap0")
 	if meta.IP != "192.168.50.145" || meta.Name != "redmi" {
 		t.Fatalf("meta=%+v", meta)
+	}
+}
+
+func TestMetaDHCPRejectsJunk(t *testing.T) {
+	dir := t.TempDir()
+	leases := filepath.Join(dir, "leases")
+	content := "1710000000 not-a-mac 192.168.50.1 bad *\n1710000000 aa:bb:cc:dd:ee:ff not-an-ip host *\n"
+	if err := os.WriteFile(leases, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := newMetaCache(leases, filepath.Join(dir, "arp"))
+	meta := m.ResolveByMAC("AA:BB:CC:DD:EE:FF", "phy0-ap0")
+	if meta.IP != "" {
+		t.Fatalf("expected empty IP, got %+v", meta)
 	}
 }

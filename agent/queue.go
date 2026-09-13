@@ -11,7 +11,7 @@ type ReportQueue struct {
 
 func newReportQueue(max int) *ReportQueue {
 	if max <= 0 {
-		max = 720
+		max = defaultQueueMax
 	}
 	return &ReportQueue{max: max, data: make([]ReportPayload, 0, 64)}
 }
@@ -21,7 +21,6 @@ func (q *ReportQueue) Push(p ReportPayload) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.data) >= q.max {
-		// drop oldest
 		copy(q.data[0:], q.data[1:])
 		q.data = q.data[:len(q.data)-1]
 	}
@@ -48,7 +47,6 @@ func (q *ReportQueue) PopBatch(n int) []ReportPayload {
 	out := make([]ReportPayload, n)
 	copy(out, q.data[:n])
 	q.data = q.data[n:]
-	// shrink backing array occasionally
 	if cap(q.data) > 256 && len(q.data) < cap(q.data)/4 {
 		n2 := make([]ReportPayload, len(q.data), len(q.data)+16)
 		copy(n2, q.data)
@@ -68,7 +66,6 @@ func (q *ReportQueue) Prepend(items []ReportPayload) {
 	combined = append(combined, items...)
 	combined = append(combined, q.data...)
 	if len(combined) > q.max {
-		// keep newest max items
 		combined = combined[len(combined)-q.max:]
 	}
 	q.data = combined

@@ -2,7 +2,8 @@ package main
 
 import (
 	"bufio"
-	"fmt"
+	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -15,10 +16,8 @@ type MetaCache struct {
 	arpPath    string
 
 	mu       sync.Mutex
-	byMAC    map[string]deviceMeta // MAC → meta
-	byIP     map[string]string     // IP → MAC
-	lastDHCP time.Time
-	lastARP  time.Time
+	byMAC    map[string]deviceMeta
+	lastLoad time.Time
 }
 
 func newMetaCache(leases, arp string) *MetaCache {
@@ -26,7 +25,6 @@ func newMetaCache(leases, arp string) *MetaCache {
 		leasesPath: leases,
 		arpPath:    arp,
 		byMAC:      make(map[string]deviceMeta),
-		byIP:       make(map[string]string),
 	}
 }
 
@@ -36,16 +34,12 @@ func (m *MetaCache) ResolveByMAC(mac, ifaceHint string) deviceMeta {
 	defer m.mu.Unlock()
 
 	now := time.Now()
-	if now.Sub(m.lastDHCP) > 15*time.Second {
-		m.reloadDHCP()
-		m.lastDHCP = now
-	}
-	if now.Sub(m.lastARP) > 10*time.Second {
-		m.reloadARP()
-		m.lastARP = now
+	if now.Sub(m.lastLoad) > 15*time.Second {
+		m.reload()
+		m.lastLoad = now
 	}
 
-	mac = strings.ToUpper(strings.TrimSpace(mac))
+	mac = stringsToUpperMAC(mac)
 	meta, ok := m.byMAC[mac]
 	if !ok {
 		meta = deviceMeta{MAC: mac}
@@ -60,15 +54,24 @@ func (m *MetaCache) ResolveByMAC(mac, ifaceHint string) deviceMeta {
 			meta.Name = mac
 		}
 	}
-	m.byMAC[mac] = meta
 	return meta
 }
 
+func (m *MetaCache) reload() {
+	next := make(map[string]deviceMeta)
+	dhcpOK := m.loadDHCP(next)
+	arpOK := m.loadARP(next)
+	if !dhcpOK && !arpOK && len(m.byMAC) > 0 {
+		return
+	}
+	m.byMAC = next
+}
+
 // dhcp.leases: <expiry> <mac> <ip> <hostname> <clientid>
-func (m *MetaCache) reloadDHCP() {
+func (m *MetaCache) loadDHCP(dst map[string]deviceMeta) bool {
 	f, err := os.Open(m.leasesPath)
 	if err != nil {
-		return
+		return false
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
@@ -77,28 +80,37 @@ func (m *MetaCache) reloadDHCP() {
 		if len(fields) < 4 {
 			continue
 		}
-		mac := strings.ToUpper(fields[1])
+		mac := stringsToUpperMAC(fields[1])
+		if mac == "" {
+			continue
+		}
 		ip := fields[2]
+		if net.ParseIP(ip) == nil {
+			continue
+		}
 		name := fields[3]
 		if name == "*" {
 			name = ""
 		}
-		cur := m.byMAC[mac]
+		cur := dst[mac]
 		cur.MAC = mac
 		cur.IP = ip
 		if name != "" {
 			cur.Name = name
 		}
-		m.byMAC[mac] = cur
-		m.byIP[ip] = mac
+		dst[mac] = cur
 	}
+	if err := sc.Err(); err != nil {
+		log.Printf("dhcp.leases scan: %v", err)
+	}
+	return true
 }
 
 // /proc/net/arp: IP address HW type Flags HW address Mask Device
-func (m *MetaCache) reloadARP() {
+func (m *MetaCache) loadARP(dst map[string]deviceMeta) bool {
 	f, err := os.Open(m.arpPath)
 	if err != nil {
-		return
+		return false
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
@@ -114,22 +126,27 @@ func (m *MetaCache) reloadARP() {
 			continue
 		}
 		ip := fields[0]
-		mac := strings.ToUpper(fields[3])
-		if mac == "00:00:00:00:00:00" || !isMAC(mac) {
+		if net.ParseIP(ip) == nil {
 			continue
 		}
-		cur := m.byMAC[mac]
+		mac := stringsToUpperMAC(fields[3])
+		if mac == "" || mac == "00:00:00:00:00:00" {
+			continue
+		}
+		cur := dst[mac]
 		cur.MAC = mac
-		// Prefer DHCP IP if already known; else take ARP.
 		if cur.IP == "" {
 			cur.IP = ip
 		}
 		if cur.Iface == "" {
 			cur.Iface = fields[5]
 		}
-		m.byMAC[mac] = cur
-		m.byIP[ip] = mac
+		dst[mac] = cur
 	}
+	if err := sc.Err(); err != nil {
+		log.Printf("arp scan: %v", err)
+	}
+	return true
 }
 
 func isMAC(s string) bool {
@@ -148,20 +165,4 @@ func isMAC(s string) bool {
 		}
 	}
 	return true
-}
-
-// ensureMAC fills a synthetic MAC when none is known (should be rare).
-func ensureMAC(mac, ip string) string {
-	if mac != "" {
-		return strings.ToUpper(mac)
-	}
-	parts := strings.Split(ip, ".")
-	if len(parts) == 4 {
-		var b [4]int
-		for i := 0; i < 4; i++ {
-			fmt.Sscanf(parts[i], "%d", &b[i])
-		}
-		return fmt.Sprintf("02:00:%02X:%02X:%02X:%02X", b[0], b[1], b[2], b[3])
-	}
-	return "02:00:00:00:00:00"
 }

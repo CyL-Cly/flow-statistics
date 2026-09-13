@@ -5,53 +5,92 @@ import (
 	"time"
 )
 
+const ifaceRefresh = 5 * time.Minute
+
+// stationReader collects associated Wi-Fi stations. Tests stub this to avoid `iw`.
+type stationReader func(ifaces []string) ([]wifiStation, error)
+
 // Collector samples Wi-Fi station cumulative counters and emits per-interval deltas.
 //
 // Data source: `iw dev <ap> station dump` (driver / mac80211 counters).
-// These are real L2 cumulative bytes for associated clients — far more accurate
-// for daily totals than PPE FOE / nf_conntrack session snapshots.
-//
 // Scope: Wi-Fi associated devices only (wired clients are not counted).
 type Collector struct {
 	cfg  Config
 	meta *MetaCache
 
-	// previous absolute counters keyed by MAC
-	prev map[string]wifiStation
+	readStations stationReader
 
-	// first sample only establishes baseline
-	primed bool
+	prev         map[string]wifiStation
+	primed       bool
+	lastSampleAt time.Time
+
+	cachedIfaces []string
+	ifacesAt     time.Time
 }
 
 func newCollector(cfg Config) *Collector {
-	ifaces := cfg.WiFiIfaces
-	if len(ifaces) == 0 {
-		ifaces = discoverAPIfaces()
-	}
-	if cfg.Verbose {
-		log.Printf("collector: Wi-Fi station counters (accurate daily totals), ifaces=%v", ifaces)
-	}
 	return &Collector{
-		cfg:  cfg,
-		meta: newMetaCache(cfg.DHCPLeases, cfg.ARPPath),
-		prev: make(map[string]wifiStation),
+		cfg:          cfg,
+		meta:         newMetaCache(cfg.DHCPLeases, cfg.ARPPath),
+		readStations: readWiFiStations,
+		prev:         make(map[string]wifiStation),
 	}
 }
 
+func (c *Collector) apIfaces() []string {
+	if len(c.cfg.WiFiIfaces) > 0 {
+		return c.cfg.WiFiIfaces
+	}
+	if len(c.cachedIfaces) > 0 && time.Since(c.ifacesAt) < ifaceRefresh {
+		return c.cachedIfaces
+	}
+	c.cachedIfaces = discoverAPIfaces()
+	c.ifacesAt = time.Now()
+	if c.cfg.Verbose {
+		log.Printf("collector: AP ifaces=%v", c.cachedIfaces)
+	}
+	return c.cachedIfaces
+}
+
 // Sample returns a report with per-device byte deltas over the last interval.
-// First call establishes baseline and returns nil.
+// First successful call establishes baseline and returns nil.
+// Any iw error leaves the previous snapshot unchanged.
 func (c *Collector) Sample() *ReportPayload {
-	ifaces := c.cfg.WiFiIfaces
-	if len(ifaces) == 0 {
-		ifaces = discoverAPIfaces()
-	}
+	now := time.Now()
+	ifaces := c.apIfaces()
 
-	stations, err := readWiFiStations(ifaces)
-	if err != nil && len(stations) == 0 {
+	read := c.readStations
+	if read == nil {
+		read = readWiFiStations
+	}
+	stations, err := read(ifaces)
+	if err != nil {
 		log.Printf("wifi station read error: %v", err)
+		c.ifacesAt = time.Time{} // rediscover next tick
+		return nil
 	}
 
-	// Deduplicate by MAC (same client should not appear on two APs; if it does, prefer larger counters).
+	cur := dedupeStations(stations)
+
+	if !c.primed {
+		c.prev = cur
+		c.primed = true
+		c.lastSampleAt = now
+		if c.cfg.Verbose {
+			log.Printf("collector: baseline stations=%d", len(cur))
+		}
+		return nil
+	}
+
+	devices := c.deviceDeltas(cur)
+	c.prev = cur
+
+	elapsed := now.Sub(c.lastSampleAt)
+	c.lastSampleAt = now
+	return c.makePayload(devices, elapsed)
+}
+
+func dedupeStations(stations []wifiStation) map[string]wifiStation {
 	cur := make(map[string]wifiStation, len(stations))
 	for _, s := range stations {
 		mac := stringsToUpperMAC(s.MAC)
@@ -60,7 +99,6 @@ func (c *Collector) Sample() *ReportPayload {
 		}
 		s.MAC = mac
 		if prev, ok := cur[mac]; ok {
-			// keep the entry with more total traffic (likely the active AP)
 			if s.RxBytes+s.TxBytes >= prev.RxBytes+prev.TxBytes {
 				cur[mac] = s
 			}
@@ -68,35 +106,27 @@ func (c *Collector) Sample() *ReportPayload {
 		}
 		cur[mac] = s
 	}
+	return cur
+}
 
-	if !c.primed {
-		c.prev = cur
-		c.primed = true
-		if c.cfg.Verbose {
-			log.Printf("collector: baseline stations=%d", len(cur))
-		}
-		return nil
-	}
-
+func (c *Collector) deviceDeltas(cur map[string]wifiStation) []DeviceReport {
 	devices := make([]DeviceReport, 0, len(cur))
-	var totalDelta int64
-
 	for mac, s := range cur {
-		var drx, dtx int64
+		drx, dtx := int64(0), int64(0)
 		if p, ok := c.prev[mac]; ok {
-			// Same association: positive growth only.
-			// Counter went backwards → driver reset / reassoc: take current as new session bytes.
-			drx = entryDelta(s.RxBytes, p.RxBytes)
-			dtx = entryDelta(s.TxBytes, p.TxBytes)
+			if p.Iface != "" && s.Iface != "" && p.Iface != s.Iface &&
+				(s.RxBytes < p.RxBytes || s.TxBytes < p.TxBytes) {
+				// Roamed to another AP whose counters start lower: new baseline, no burst.
+			} else {
+				drx = entryDelta(s.RxBytes, p.RxBytes)
+				dtx = entryDelta(s.TxBytes, p.TxBytes)
+			}
 		}
-		// brand-new MAC this tick: baseline only (no delta) — avoids counting pre-agent history
 
 		if drx == 0 && dtx == 0 {
 			continue
 		}
-		totalDelta += drx + dtx
 
-		// s.RxBytes / s.TxBytes already client download / upload (see wifi.go).
 		meta := c.meta.ResolveByMAC(mac, s.Iface)
 		devices = append(devices, DeviceReport{
 			MAC:     mac,
@@ -107,18 +137,22 @@ func (c *Collector) Sample() *ReportPayload {
 			TxBytes: dtx,
 		})
 	}
+	return devices
+}
 
-	// Drop disappeared MACs from prev by replacing with current snapshot.
-	c.prev = cur
-
-	sec := int(c.cfg.Interval / time.Second)
-	if sec <= 0 {
-		sec = 30
+func (c *Collector) makePayload(devices []DeviceReport, elapsed time.Duration) *ReportPayload {
+	sec := int(elapsed.Round(time.Second) / time.Second)
+	if sec < 1 {
+		sec = 1
 	}
 
 	if c.cfg.Verbose && len(devices) > 0 {
+		var totalDelta int64
+		for _, d := range devices {
+			totalDelta += d.RxBytes + d.TxBytes
+		}
 		log.Printf("sample devices=%d stations=%d delta_bytes=%d (avg %.2f KB/s over %ds)",
-			len(devices), len(cur), totalDelta, float64(totalDelta)/float64(sec)/1024, sec)
+			len(devices), len(c.prev), totalDelta, float64(totalDelta)/float64(sec)/1024, sec)
 	}
 
 	return &ReportPayload{
@@ -140,10 +174,7 @@ func entryDelta(cur, prev int64) int64 {
 
 func stringsToUpperMAC(mac string) string {
 	if !isMAC(mac) {
-		// still normalize if length ok
-		if len(mac) != 17 {
-			return ""
-		}
+		return ""
 	}
 	b := make([]byte, len(mac))
 	for i := 0; i < len(mac); i++ {

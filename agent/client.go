@@ -10,13 +10,14 @@ import (
 	"time"
 )
 
+const flushBatchSize = 60
+
 // Reporter posts samples to the public server with offline FIFO + backoff.
 type Reporter struct {
 	cfg    Config
 	client *http.Client
 	queue  *ReportQueue
 
-	// exponential backoff state
 	failStreak int
 	nextTry    time.Time
 }
@@ -26,65 +27,73 @@ func newReporter(cfg Config) *Reporter {
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: cfg.HTTPTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				// Do not forward X-Device-Token across 30x (Go only strips Authorization).
+				return http.ErrUseLastResponse
+			},
 		},
 		queue: newReportQueue(cfg.QueueMax),
 	}
 }
 
 // Enqueue stores a sample for (re)transmission.
+// Empty device lists are heartbeats: queued only when nothing else is waiting.
 func (r *Reporter) Enqueue(p ReportPayload) {
-	// Skip completely empty device lists to save queue space, but still
-	// allow them if you want heartbeat — we keep non-empty only.
-	if len(p.Devices) == 0 {
+	if len(p.Devices) == 0 && r.queue.Len() > 0 {
 		return
 	}
 	r.queue.Push(p)
 }
 
 // Flush attempts to send queued reports (batch when multiple).
-func (r *Reporter) Flush() {
-	if time.Now().Before(r.nextTry) {
-		return
-	}
-	if r.queue.Len() == 0 {
-		return
-	}
+// force ignores backoff and drains until empty or a send fails.
+func (r *Reporter) Flush(force bool) {
+	for {
+		if !force && time.Now().Before(r.nextTry) {
+			return
+		}
+		if r.queue.Len() == 0 {
+			return
+		}
 
-	// Batch up to 60 samples (~5 min at 5s) per request.
-	batch := r.queue.PopBatch(60)
-	if len(batch) == 0 {
-		return
-	}
+		batch := r.queue.PopBatch(flushBatchSize)
+		if len(batch) == 0 {
+			return
+		}
 
-	var (
-		body []byte
-		err  error
-	)
-	if len(batch) == 1 {
-		body, err = json.Marshal(batch[0])
-	} else {
-		body, err = json.Marshal(batch)
-	}
-	if err != nil {
-		log.Printf("marshal report: %v", err)
-		r.queue.Prepend(batch)
-		return
-	}
+		var (
+			body []byte
+			err  error
+		)
+		if len(batch) == 1 {
+			body, err = json.Marshal(batch[0])
+		} else {
+			body, err = json.Marshal(batch)
+		}
+		if err != nil {
+			log.Printf("marshal report: %v", err)
+			r.queue.Prepend(batch)
+			return
+		}
 
-	if err := r.post(body); err != nil {
-		r.failStreak++
-		backoff := backoffDuration(r.failStreak)
-		r.nextTry = time.Now().Add(backoff)
-		log.Printf("report failed (streak=%d backoff=%s): %v; re-queue %d", r.failStreak, backoff, err, len(batch))
-		r.queue.Prepend(batch)
-		return
-	}
+		if err := r.post(body); err != nil {
+			r.failStreak++
+			backoff := backoffDuration(r.failStreak)
+			r.nextTry = time.Now().Add(backoff)
+			log.Printf("report failed (streak=%d backoff=%s): %v; re-queue %d", r.failStreak, backoff, err, len(batch))
+			r.queue.Prepend(batch)
+			return
+		}
 
-	r.failStreak = 0
-	r.nextTry = time.Time{}
-	if r.cfg.Verbose {
-		if left := r.queue.Len(); left > 0 {
-			log.Printf("report ok, %d still queued", left)
+		r.failStreak = 0
+		r.nextTry = time.Time{}
+		if r.cfg.Verbose {
+			if left := r.queue.Len(); left > 0 {
+				log.Printf("report ok, %d still queued", left)
+			}
+		}
+		if !force {
+			return
 		}
 	}
 }
@@ -111,20 +120,10 @@ func (r *Reporter) post(body []byte) error {
 }
 
 func backoffDuration(streak int) time.Duration {
-	// 2s, 4s, 8s ... cap 5m
+	// 2s, 4s, 8s ... cap 256s
 	d := time.Second * time.Duration(1<<min(streak, 8))
 	if d < 2*time.Second {
 		d = 2 * time.Second
 	}
-	if d > 5*time.Minute {
-		d = 5 * time.Minute
-	}
 	return d
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

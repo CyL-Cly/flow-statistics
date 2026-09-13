@@ -107,12 +107,13 @@ go build -o service_all .
 | 文件 | 说明 |
 |------|------|
 | `traffic-agent-linux-arm64` | 交叉编译静态二进制 |
+| `traffic-agent-linux-arm64.sha256` | 二进制 sha256（安装时强制校验） |
 | `flow-statistics_install.sh` | 安装：下载、随机 ROUTER_ID、procd 服务 |
 | `flow-statistics_uninstall.sh` | 卸载（默认保留 `/etc/flow-statistics`） |
 
 ```bash
-# 安装（结束时打印 ROUTER_ID）
-wget -qO- https://dagongren.tech/public/flow-statistics/flow-statistics_install.sh | sh
+# 安装（必须提供与 Server 一致的 token；结束时打印 ROUTER_ID）
+FS_TOKEN=your-secret wget -qO- https://dagongren.tech/public/flow-statistics/flow-statistics_install.sh | sh
 
 # 卸载（保留配置与 ROUTER_ID，重装可复用）
 wget -qO- https://dagongren.tech/public/flow-statistics/flow-statistics_uninstall.sh | sh
@@ -125,15 +126,20 @@ FS_PURGE_CONF=1 sh flow-statistics_uninstall.sh
 
 - 校验 `uname -m` 为 `aarch64`/`arm64`，内核主版本 ≥ `6.12`
 - 需要 `iw` + `curl|wget|uclient-fetch`
-- **ROUTER_ID**：若 `/etc/flow-statistics/agent.conf` 已有则复用；否则随机 10 位字母数字；可用 `FS_ROUTER_ID=xxx` 指定
+- **FS_TOKEN 必填**（安装脚本不再内置共享 token）。已有 `/etc/flow-statistics/agent.conf` 时可省略以复用旧 TOKEN
+- **ROUTER_ID**：若 conf 已有则复用；否则随机 10 位字母数字；可用 `FS_ROUTER_ID=xxx` 指定
 - 二进制：`/usr/sbin/traffic-agent`，服务：`/etc/init.d/flow-statistics`
+- Token 经 procd `env` 注入 `TRAFFIC_TOKEN`，**不出现在进程命令行**
+- 下载后校验 `traffic-agent-linux-arm64.sha256`（`FS_SKIP_HASH=1` 可跳过，不推荐）
 - 默认上报：`https://dagongren.tech/api/v1/traffic/report`
 
 覆盖示例：
 
 ```bash
-FS_ROUTER_ID=home-ax6000 FS_INTERVAL=30s sh flow-statistics_install.sh
+FS_TOKEN=your-secret FS_ROUTER_ID=home-ax6000 FS_INTERVAL=30s sh flow-statistics_install.sh
 ```
+
+**升级（已装旧版）**：旧安装脚本曾把共享 token 写进 `-token` 命令行。请先在 Server 轮换 `TRAFFIC_DEVICE_TOKEN`，再带新 `FS_TOKEN` 重跑安装脚本（会改 init 为 env 注入）。仅重装二进制不够。
 
 ### 本地交叉编译
 
@@ -141,39 +147,47 @@ FS_ROUTER_ID=home-ax6000 FS_INTERVAL=30s sh flow-statistics_install.sh
 cd agent
 # OpenWrt aarch64（当前正式发布架构）
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o traffic-agent-linux-arm64 .
+sha256sum traffic-agent-linux-arm64 | awk '{print $1}' > traffic-agent-linux-arm64.sha256
 
 # 可选：mipsle softfloat
 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -ldflags="-s -w" -o traffic-agent .
 ```
 
-手动运行：
+手动运行（token 走环境变量，避免出现在 `ps`）：
 
 ```bash
+export TRAFFIC_TOKEN=your-secret
 ./traffic-agent \
   -server https://your.domain/api/v1/traffic/report \
-  -token your-secret \
   -router-id main-router-01 \
   -interval 30s
 # 可选：固定 AP 接口，默认自动发现
 #  -wifi-ifaces phy0-ap0,phy1-ap0
 ```
 
+空 / 占位 token（`change-me-traffic-token`）会拒绝启动。非 loopback 的上报 URL 必须是 `https://`。HTTP 不跟随 30x，避免 token 被带到外域。
+
 | 参数 / 环境变量 | 说明 |
 |-----------------|------|
-| `-server` / `TRAFFIC_SERVER` | 上报 URL |
-| `-token` / `TRAFFIC_TOKEN` | 与 Server 一致的 Token |
+| `-server` / `TRAFFIC_SERVER` | 上报 URL；非本机须 https |
+| `TRAFFIC_TOKEN`（推荐） / `-token` | 与 Server 一致的 Token；**优先用环境变量** |
 | `-router-id` / `TRAFFIC_ROUTER_ID` | 路由器 ID |
-| `-interval` / `TRAFFIC_INTERVAL` | 采样窗口，默认 **30s** |
-| `-wifi-ifaces` / `TRAFFIC_WIFI_IFACES` | AP 接口列表，逗号分隔；空=自动发现 |
-| `-queue-max` | 离线 FIFO 上限（默认 120 ≈ 1h@30s） |
+| `-interval` / `TRAFFIC_INTERVAL` | 采样窗口，默认 **30s**，下限 **5s** |
+| `-wifi-ifaces` / `TRAFFIC_WIFI_IFACES` | AP 接口列表，逗号分隔；空=`iw dev` 发现 type AP |
+| `-queue-max` / `TRAFFIC_QUEUE_MAX` | 离线 FIFO 上限（默认 120 ≈ 1h@30s） |
+| `-leases` / `TRAFFIC_DHCP_LEASES` | dhcp.leases 路径 |
+| `-arp` / `TRAFFIC_ARP` | ARP 表路径 |
+| `-http-timeout` / `TRAFFIC_HTTP_TIMEOUT` | HTTP 超时，默认 8s；`0` 回落 8s |
+| `-verbose` / `TRAFFIC_VERBOSE` | 每轮采样摘要日志（默认关） |
 
 ### 采集逻辑
 
-1. **数据源**：`iw dev <ap> station dump` 的驱动级累计 `rx bytes` / `tx bytes`（**仅 Wi‑Fi 已关联设备**）。
+1. **数据源**：`iw dev <ap> station dump` 的驱动级累计 `rx bytes` / `tx bytes`（**仅 Wi‑Fi 已关联设备**）。`iw` 带超时；失败时**保留**上一轮基线，避免把短暂故障算成全站新会话。
 2. **方向映射**（AP 视角 → 客户端）：`iw tx` = 下行（下载），`iw rx` = 上行（上传）。
-3. **差分**：按 **MAC** 对累计计数器做 `cur - prev`；新出现站点本周期只建基线，避免把历史总量算进今日。
-4. **元数据**：`/tmp/dhcp.leases`、`/proc/net/arp` 补全 IP / 主机名。
-5. **可靠性**：上报失败入内存 FIFO，指数退避后批量补发。
+3. **差分**：按 **MAC** 对累计计数器做 `cur - prev`；新出现站点本周期只建基线。跨 AP 漫游且计数回落时本周期不计突发。
+4. **`interval_sec`**：两次成功采样的墙上时间，不是配置字面量。HTTP 上报在独立 goroutine，不阻塞采样。
+5. **元数据**：`/tmp/dhcp.leases`、`/proc/net/arp` 补全 IP / 主机名。
+6. **可靠性**：上报失败入内存 FIFO，指数退避后批量补发；关机忽略退避强制 Flush。全空闲时仍发空 `devices` 心跳（队列非空时不重复入队）。
 
 > 不用 PPE / conntrack / iptables / DPI。CPU 开销低。  
 > **范围**：有线客户端不统计。路由器需有 `iw`。

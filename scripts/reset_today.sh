@@ -1,7 +1,10 @@
 #!/bin/bash
-TOKEN="dd16d55a075f1429067e86be1a0b576c"
-curl -sS -X POST "http://127.0.0.1:50000/api/v1/traffic/reset" \
+set -euo pipefail
+TOKEN="${TRAFFIC_TOKEN:?set TRAFFIC_TOKEN}"
+BASE="${TRAFFIC_BASE:-http://127.0.0.1:50000}"
+ROUTER_ID="${TRAFFIC_ROUTER_ID:-main-router-01}"
+curl -sS -X POST "${BASE}/api/v1/traffic/reset" \
   -H "X-Device-Token: ${TOKEN}"
 echo
-curl -sS -H "X-User-ID: smoke" "http://127.0.0.1:50000/api/v1/traffic/stats"
+curl -sS -H "X-User-ID: smoke" "${BASE}/api/v1/traffic/stats?router_id=${ROUTER_ID}"
 echo

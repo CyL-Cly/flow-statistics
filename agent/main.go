@@ -9,28 +9,50 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, a := range os.Args[1:] {
+		if a == "-token" || strings.HasPrefix(a, "-token=") {
+			log.Printf("warning: -token is visible in process list; use TRAFFIC_TOKEN")
+			break
+		}
+	}
 	log.Printf("traffic-agent start router_id=%s interval=%s server=%s source=wifi-station verbose=%v",
 		cfg.RouterID, cfg.Interval, cfg.ServerURL, cfg.Verbose)
 
 	col := newCollector(cfg)
 	rep := newReporter(cfg)
 
-	interval := cfg.Interval
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		flushTicker := time.NewTicker(time.Second)
+		defer flushTicker.Stop()
+		for {
+			select {
+			case <-flushTicker.C:
+				rep.Flush(false)
+			case <-stop:
+				rep.Flush(true)
+				return
+			}
+		}
+	}()
 
-	flushTicker := time.NewTicker(time.Second)
-	defer flushTicker.Stop()
+	t := time.NewTicker(cfg.Interval)
+	defer t.Stop()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -43,15 +65,11 @@ func main() {
 		case <-t.C:
 			if p := col.Sample(); p != nil {
 				rep.Enqueue(*p)
-				rep.Flush()
-			}
-		case <-flushTicker.C:
-			if rep.queue.Len() > 0 {
-				rep.Flush()
 			}
 		case s := <-sig:
 			log.Printf("signal %v, exit", s)
-			rep.Flush()
+			close(stop)
+			wg.Wait()
 			return
 		}
 	}
