@@ -1,0 +1,11 @@
+# Build artifacts
+agent/traffic-agent
+agent/traffic-agent.exe
+agent/traffic-agent-linux-arm64
+*.exe
+*.sha256
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
