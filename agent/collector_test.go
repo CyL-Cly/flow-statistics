@@ -65,8 +65,8 @@ func TestSampleFailedReadKeepsBaseline(t *testing.T) {
 	if c.Sample() != nil {
 		t.Fatal("baseline")
 	}
-	if p := c.Sample(); p != nil {
-		t.Fatalf("failed read should return nil, got %+v", p)
+	if p := c.Sample(); p == nil || len(p.Devices) != 0 {
+		t.Fatalf("failed read should return empty heartbeat, got %+v", p)
 	}
 	if !c.primed || len(c.prev) != 1 {
 		t.Fatalf("primed=%v prev=%d", c.primed, len(c.prev))
@@ -99,8 +99,8 @@ func TestSamplePartialErrorKeepsBaseline(t *testing.T) {
 	if c.Sample() != nil {
 		t.Fatal("baseline")
 	}
-	if p := c.Sample(); p != nil {
-		t.Fatalf("partial error should keep prev, got %+v", p)
+	if p := c.Sample(); p == nil || len(p.Devices) != 0 {
+		t.Fatalf("partial error should keep prev and return heartbeat, got %+v", p)
 	}
 	c.lastSampleAt = time.Now().Add(-30 * time.Second)
 	p := c.Sample()

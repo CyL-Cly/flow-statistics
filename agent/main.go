@@ -15,6 +15,10 @@ import (
 	"time"
 )
 
+// flushDeadline bounds the shutdown flush wait so a slow server cannot
+// stall the OpenWrt reboot sequence indefinitely.
+const flushDeadline = 15 * time.Second
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg, err := loadConfig()
@@ -69,7 +73,20 @@ func main() {
 		case s := <-sig:
 			log.Printf("signal %v, exit", s)
 			close(stop)
-			wg.Wait()
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case s2 := <-sig:
+				log.Printf("signal %v, force exit", s2)
+				os.Exit(0)
+			case <-time.After(flushDeadline):
+				log.Printf("flush deadline exceeded, %d report(s) unsent", rep.queue.Len())
+				os.Exit(0)
+			}
 			return
 		}
 	}

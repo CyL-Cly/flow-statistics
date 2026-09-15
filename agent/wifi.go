@@ -96,7 +96,20 @@ func runIW(timeout time.Duration, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "iw", args...)
-	return cmd.Output()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	b, err := cmd.Output()
+	if err != nil {
+		// iw failure reasons live on stderr (e.g. "command failed: ...").
+		msg := strings.TrimSpace(stderr.String())
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		if msg != "" {
+			return b, fmt.Errorf("%w: %s", err, msg)
+		}
+	}
+	return b, err
 }
 
 // readWiFiStations collects per-station cumulative rx/tx via `iw station dump`.

@@ -121,9 +121,16 @@ fi
 
 rand_router_id() {
   if [ -r /dev/urandom ] && command -v tr >/dev/null 2>&1; then
-    tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 10
-    return
+    _id="$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 10)"
+    if [ -n "$_id" ]; then printf '%s' "$_id"; return; fi
   fi
+  # Fallback: decimal bytes from /dev/urandom (unpredictable, avoids
+  # date+%s/awk-rand collisions when two routers install in the same second).
+  if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+    _id="$(od -An -N8 -tu8 /dev/urandom 2>/dev/null | tr -d ' \n' | tail -c 10)"
+    if [ -n "$_id" ]; then printf '%s' "$_id"; return; fi
+  fi
+  # Last resort: predictable, only used when /dev/urandom is unreadable.
   echo "r$(date +%s | tail -c 7)$(awk 'BEGIN{srand(); printf "%03d", int(rand()*1000)}')"
 }
 
@@ -146,6 +153,14 @@ if [ -n "$USER_INTERVAL" ]; then
 elif [ -n "$EXISTING_INTERVAL" ]; then
   FS_INTERVAL="$EXISTING_INTERVAL"
 fi
+
+# Agent refuses non-loopback http at startup (config would fail to validate);
+# fail here instead of an invisible procd respawn loop.
+case "$FS_SERVER" in
+  https://*) ;;
+  http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
+  *) die "FS_SERVER must be https:// for non-loopback (agent rejects plain http): $FS_SERVER" ;;
+esac
 
 # --- write conf (single-quoted values; sourced by init) ---
 {

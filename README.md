@@ -143,6 +143,8 @@ FS_TOKEN=your-secret FS_ROUTER_ID=home-ax6000 FS_INTERVAL=30s sh flow-statistics
 
 ### 本地交叉编译
 
+Windows 下可直接运行 `agent\build.bat`（vet + test + 交叉编译 + 生成 `.sha256` 一条龙）。手动命令：
+
 ```bash
 cd agent
 # OpenWrt aarch64（当前正式发布架构）

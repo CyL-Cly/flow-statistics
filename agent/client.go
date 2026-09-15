@@ -13,6 +13,7 @@ import (
 const flushBatchSize = 60
 
 // Reporter posts samples to the public server with offline FIFO + backoff.
+// Flush must only be called from a single goroutine (see failStreak/nextTry).
 type Reporter struct {
 	cfg    Config
 	client *http.Client

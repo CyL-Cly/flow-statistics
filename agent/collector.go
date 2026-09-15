@@ -54,7 +54,8 @@ func (c *Collector) apIfaces() []string {
 
 // Sample returns a report with per-device byte deltas over the last interval.
 // First successful call establishes baseline and returns nil.
-// Any iw error leaves the previous snapshot unchanged.
+// Any iw error keeps the previous snapshot and returns an empty heartbeat
+// payload (no devices) so the server still sees the router online.
 func (c *Collector) Sample() *ReportPayload {
 	now := time.Now()
 	ifaces := c.apIfaces()
@@ -67,7 +68,13 @@ func (c *Collector) Sample() *ReportPayload {
 	if err != nil {
 		log.Printf("wifi station read error: %v", err)
 		c.ifacesAt = time.Time{} // rediscover next tick
-		return nil
+		// Emit an empty heartbeat so the router is not marked offline while
+		// iw keeps failing; deltas stay correct because the baseline is kept.
+		elapsed := now.Sub(c.lastSampleAt)
+		if !c.primed || elapsed <= 0 {
+			elapsed = c.cfg.Interval
+		}
+		return c.makePayload([]DeviceReport{}, elapsed)
 	}
 
 	cur := dedupeStations(stations)
